@@ -275,3 +275,172 @@ CREATE TABLE IF NOT EXISTS impact_item (
     handled     BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_impact_disruption ON impact_item(disruption_id);
+
+-- ============================================================================
+-- feature-4：馈线临时降容告警 → 在泊船舶岸电分时分配 / 削减补偿 / 不可变回执
+-- 功率字段统一用整数 kW 存储（0.6MW = 600kW），避免浮点误差。
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS power_feeder (
+    id                 BIGSERIAL PRIMARY KEY,
+    code               VARCHAR(40) UNIQUE NOT NULL,   -- 馈线编号，如 FD-01
+    name               VARCHAR(128) NOT NULL,
+    normal_capacity_kw INT NOT NULL,                  -- 正常额定容量（2000kW）
+    safety_capacity_kw INT NOT NULL,                  -- 当前安全上限（告警时降到 1200kW）
+    status             VARCHAR(24) NOT NULL DEFAULT 'NORMAL', -- NORMAL / DERATED
+    created_at         TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS power_account (
+    id                           BIGSERIAL PRIMARY KEY,
+    feeder_id                    BIGINT NOT NULL REFERENCES power_feeder(id),
+    code                         VARCHAR(40) UNIQUE NOT NULL, -- PA-01..
+    berth_code                   VARCHAR(20),
+    ship_code                    VARCHAR(40),
+    ship_name                    VARCHAR(128) NOT NULL,
+    cargo_class                  VARCHAR(24) NOT NULL,        -- REEFER / GENERAL
+    cargo_detail                 TEXT,
+    reefer_box_count             INT NOT NULL DEFAULT 0,
+    demanded_kw                  INT NOT NULL,                 -- 申报/确认最大需量
+    safety_floor_kw              INT NOT NULL DEFAULT 0,      -- 货物最低安全负荷
+    continuous                   BOOLEAN NOT NULL DEFAULT FALSE,
+    transfer_if_below            BOOLEAN NOT NULL DEFAULT FALSE, -- 低于下限需转移冷藏箱
+    confirmed_at                 TIMESTAMP NOT NULL,          -- 供电承诺确认时间
+    confirm_seq                  INT NOT NULL,                -- 由确认时间映射的次序
+    compensation_rate_per_mwh    INT NOT NULL DEFAULT 200,     -- 模拟补偿标准 元/MWh
+    cargo_risk_note              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_power_account_feeder ON power_account(feeder_id);
+
+-- 已确认用电作业（供电承诺的分解项），削减/补偿必须归因到这些作业
+CREATE TABLE IF NOT EXISTS power_commitment (
+    id             BIGSERIAL PRIMARY KEY,
+    account_id     BIGINT NOT NULL REFERENCES power_account(id) ON DELETE CASCADE,
+    commit_no      VARCHAR(40) UNIQUE NOT NULL,
+    seq_no         INT NOT NULL,
+    operation_name VARCHAR(128) NOT NULL,
+    required_kw    INT NOT NULL,
+    min_kw         INT NOT NULL DEFAULT 0,
+    flexible       BOOLEAN NOT NULL DEFAULT FALSE, -- 可错峰/可转移/可暂停
+    confirmed_at   TIMESTAMP NOT NULL,
+    status         VARCHAR(24) NOT NULL DEFAULT 'CONFIRMED'
+);
+CREATE INDEX IF NOT EXISTS idx_power_commit_account ON power_commitment(account_id);
+
+CREATE TABLE IF NOT EXISTS power_alarm (
+    id                   BIGSERIAL PRIMARY KEY,
+    alarm_no             VARCHAR(40) UNIQUE NOT NULL,
+    feeder_id            BIGINT NOT NULL REFERENCES power_feeder(id),
+    from_capacity_kw     INT NOT NULL,
+    derated_capacity_kw  INT NOT NULL,
+    reason               TEXT,
+    alarm_at             TIMESTAMP NOT NULL,
+    window_start         TIMESTAMP NOT NULL,
+    window_end           TIMESTAMP NOT NULL,
+    slot_minutes         INT NOT NULL DEFAULT 30,
+    status               VARCHAR(16) NOT NULL DEFAULT 'ACTIVE', -- ACTIVE / REVOKED
+    revoked_at           TIMESTAMP,
+    revoke_reason        TEXT,
+    restored_capacity_kw INT,
+    created_by           VARCHAR(64),
+    created_at           TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_power_alarm_feeder ON power_alarm(feeder_id, status);
+
+-- 分配方案：一次告警产生两种顺序的对照方案；撤销后再产生 FULL_RESTORE 新方案
+CREATE TABLE IF NOT EXISTS power_plan (
+    id                      BIGSERIAL PRIMARY KEY,
+    plan_no                 VARCHAR(48) UNIQUE NOT NULL,
+    alarm_id                BIGINT REFERENCES power_alarm(id) ON DELETE CASCADE,
+    feeder_id               BIGINT NOT NULL,
+    strategy                VARCHAR(32) NOT NULL, -- CONFIRMATION_ORDER/CARGO_SAFETY/FULL_RESTORE
+    phase                   VARCHAR(16) NOT NULL, -- EMERGENCY / RESTORED
+    capacity_limit_kw       INT NOT NULL,
+    slot_minutes            INT NOT NULL,
+    slot_count              INT NOT NULL,
+    feasible                BOOLEAN NOT NULL,     -- 馈线逐时段总量核验通过
+    safety_feasible         BOOLEAN NOT NULL,      -- 货物安全负荷全部保住
+    feeder_total_check_pass BOOLEAN NOT NULL,
+    total_demand_kw         INT,
+    peak_total_kw           INT,
+    naive_trap_json         TEXT,                 -- “逐船独立降额”反例
+    slot_checks_json        TEXT,                 -- 逐时段馈线总量核验
+    restoration_json        TEXT,                 -- 恢复次序
+    warnings_json           TEXT,
+    comparison_note         TEXT,
+    issued                  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at              TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_power_plan_alarm ON power_plan(alarm_id);
+
+CREATE TABLE IF NOT EXISTS power_allocation (
+    id              BIGSERIAL PRIMARY KEY,
+    plan_id         BIGINT NOT NULL REFERENCES power_plan(id) ON DELETE CASCADE,
+    account_id      BIGINT NOT NULL REFERENCES power_account(id),
+    slot_index      INT NOT NULL,
+    slot_start      TIMESTAMP NOT NULL,
+    slot_end        TIMESTAMP NOT NULL,
+    demanded_kw     INT NOT NULL,
+    allocated_kw    INT NOT NULL,
+    curtailed_kw    INT NOT NULL,
+    safety_floor_kw INT NOT NULL DEFAULT 0,
+    safety_violation BOOLEAN NOT NULL DEFAULT FALSE,
+    basis           VARCHAR(40)
+);
+CREATE INDEX IF NOT EXISTS idx_power_alloc_plan ON power_allocation(plan_id);
+
+CREATE TABLE IF NOT EXISTS power_curtailment (
+    id                          BIGSERIAL PRIMARY KEY,
+    plan_id                     BIGINT NOT NULL REFERENCES power_plan(id) ON DELETE CASCADE,
+    account_id                  BIGINT NOT NULL,
+    commitment_id               BIGINT,
+    commitment_no               VARCHAR(40),
+    slot_index                  INT,
+    slot_start                  TIMESTAMP,
+    slot_end                    TIMESTAMP,
+    operation_name              VARCHAR(128),
+    requested_kw                INT,
+    allocated_kw                INT,
+    curtailed_kw                INT,
+    duration_min                INT,
+    curtailed_energy_mwh        NUMERIC(12,4),
+    compensation_rate_per_mwh   INT,
+    compensation_amount_cny     NUMERIC(12,2),
+    basis_code                  VARCHAR(40),
+    reason                      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_power_curt_plan ON power_curtailment(plan_id);
+
+CREATE TABLE IF NOT EXISTS power_cargo_impact (
+    id                BIGSERIAL PRIMARY KEY,
+    plan_id           BIGINT NOT NULL REFERENCES power_plan(id) ON DELETE CASCADE,
+    account_id        BIGINT NOT NULL,
+    cargo_class       VARCHAR(24),
+    cargo_detail      TEXT,
+    reefer_box_count  INT,
+    safety_floor_kw   INT,
+    min_allocated_kw  INT,
+    deficit_kw        INT,
+    risk_level        VARCHAR(16),  -- CRITICAL / WARNING / OK
+    transfer_required BOOLEAN NOT NULL DEFAULT FALSE,
+    message           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_power_cargo_plan ON power_cargo_impact(plan_id);
+
+-- 不可变供电调度回执：只增，不改不删（触发器 trg_power_receipt_immutable 由 Java 下发）
+CREATE SEQUENCE IF NOT EXISTS power_receipt_seq;
+CREATE TABLE IF NOT EXISTS power_receipt (
+    id                BIGSERIAL PRIMARY KEY,
+    receipt_no        VARCHAR(40) UNIQUE NOT NULL,
+    plan_id           BIGINT NOT NULL REFERENCES power_plan(id),
+    alarm_id          BIGINT REFERENCES power_alarm(id),
+    feeder_code       VARCHAR(40),
+    strategy          VARCHAR(32),
+    phase             VARCHAR(16),
+    capacity_limit_kw INT,
+    issued_by         VARCHAR(64),
+    note              TEXT,
+    snapshot_json     TEXT NOT NULL,
+    issued_at         TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_power_receipt_alarm ON power_receipt(alarm_id);

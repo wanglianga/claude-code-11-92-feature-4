@@ -29,15 +29,19 @@ public class SeedService implements ApplicationRunner {
 
     private final JdbcTemplate jdbc;
     private final CatalogDao catalogDao;
+    private final PowerService powerService;
 
-    public SeedService(JdbcTemplate jdbc, CatalogDao catalogDao) {
+    public SeedService(JdbcTemplate jdbc, CatalogDao catalogDao, PowerService powerService) {
         this.jdbc = jdbc;
         this.catalogDao = catalogDao;
+        this.powerService = powerService;
     }
 
     @Override
     public void run(ApplicationArguments args) {
         seedIfEmpty();
+        // 老库可能已有账号数据而没有 feature-4 供电表数据，单独保证供电样例存在
+        powerService.seedIfEmpty();
     }
 
     public synchronized void seedIfEmpty() {
@@ -50,12 +54,16 @@ public class SeedService implements ApplicationRunner {
     /**清空全部业务表并恢复固定样例（回放/演示用）*/
     public synchronized void resetAndSeed() {
         jdbc.execute("""
-                TRUNCATE TABLE impact_item, disruption, plan_event, work_record,
+                TRUNCATE TABLE power_receipt, power_curtailment, power_cargo_impact,
+                    power_allocation, power_plan, power_alarm, power_commitment,
+                    power_account, power_feeder,
+                    impact_item, disruption, plan_event, work_record,
                     resource_occupation, resource_lock, plan_segment, berth_plan,
                     equipment_fault, work_window, quay_crane, tug, pilot, tide_slot,
                     berth_cargo_limit, berth, voyage, ship, auth_token, app_user
                 RESTART IDENTITY CASCADE
                 """);
+        jdbc.execute("ALTER SEQUENCE power_receipt_seq RESTART WITH 1");
         seedAll();
         log.info("场景已重置并重新播种");
     }
@@ -70,6 +78,7 @@ public class SeedService implements ApplicationRunner {
         seedPilots();
         seedTugs();
         seedCranes();
+        powerService.seedFixedScenario();
     }
 
     private void seedUsers() {

@@ -52,6 +52,11 @@ public class GlobalExceptionHandler {
             body.put("message", "已完成的引航/装卸记录不可修改或删除，只能通过重排延续未完成作业");
             return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
         }
+        if (msg != null && msg.contains("POWER_RECEIPT_IMMUTABLE")) {
+            body.put("code", "POWER_RECEIPT_IMMUTABLE");
+            body.put("message", "供电调度回执一经签发不可修改或删除；告警撤销只会生成新方案与新回执，旧回执原样保留");
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+        }
         log.warn("数据完整性冲突", ex);
         body.put("code", "DATA_INTEGRITY_VIOLATION");
         body.put("message", msg);

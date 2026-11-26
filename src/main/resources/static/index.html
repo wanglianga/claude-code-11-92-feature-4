@@ -43,6 +43,7 @@
       <button data-tab="team" class="tab" onclick="switchTab('team')">③ 班组看板</button>
       <button data-tab="sim" class="tab" onclick="switchTab('sim')">④ 模拟与扰动</button>
       <button data-tab="replay" class="tab" onclick="switchTab('replay')">⑤ 一键回放验证</button>
+      <button data-tab="power" class="tab power-tab" onclick="switchTab('power')">⑥ 供电调度（馈线降容）</button>
     </nav>
     <div class="topbar-right">
       <span id="current-user" class="user-badge"></span>
@@ -161,11 +162,55 @@
         <div class="row gap wrap">
           <button class="btn primary big" id="btn-orderings" onclick="runReplay('orderings')">▶ 回放三种顺序 + 并发/策略对照</button>
           <button class="btn warn big" id="btn-disruptions" onclick="runReplay('disruptions')">▶ 回放潮汐/岸桥扰动</button>
+          <button class="btn" id="btn-power" style="background:#fff3e0;border-color:#e8912d;color:#8a4b00" onclick="runReplay('power')">⚡ 回放供电降容场景</button>
           <button class="btn success big" id="btn-full" onclick="runReplay('full')">▶ 完整回放</button>
           <button class="btn danger" onclick="resetScenario()">重置样例数据</button>
         </div>
         <div id="replay-summary"></div>
         <div id="replay-result"></div>
+      </div>
+    </section>
+
+    <!-- ⑥ 供电调度（feature-4） -->
+    <section id="tab-power" class="tab-panel">
+      <div class="card power-hero">
+        <div class="row-between wrap">
+          <div>
+            <h2 style="margin-bottom:4px">⚡ 供电调度台 · 馈线临时降容分时分配</h2>
+            <p class="hint" style="max-width:920px">
+              馈线 <b id="pw-feeder-code">FD-01</b> 临时降到 <b class="danger-text">1.2MW</b> 安全上限，
+              三艘在泊船分别需要 <b>0.6 / 0.5 / 0.4MW</b>；其中冷藏船必须连续保有至少
+              <b class="danger-text">0.4MW</b>，否则需转移冷藏箱并产生货损风险。
+              值班电工在此比对两种顺序、核对馈线总量、查看被削减的已确认作业与补偿依据、恢复次序，
+              并下达回执。告警撤销只生成恢复新方案，<b>旧回执不可修改</b>。
+            </p>
+          </div>
+          <div class="row gap wrap">
+            <label class="hint">降容上限 MW
+              <input id="pw-derated" type="number" value="1.2" min="0.1" max="2" step="0.1"
+                     style="width:84px" />
+            </label>
+            <label class="hint">时段(分)
+              <input id="pw-slot" type="number" value="30" min="10" max="120" step="10"
+                     style="width:74px" />
+            </label>
+            <button class="btn warn big" id="pw-raise-btn" onclick="powerRaiseAlarm()">⚡ 输入馈线告警并出方案</button>
+            <button class="btn success big hidden" id="pw-revoke-btn" onclick="powerRevoke()">↩ 告警撤销·生成恢复新方案</button>
+          </div>
+        </div>
+        <div id="pw-feeder-status" class="pw-feeder-status"></div>
+      </div>
+
+      <div id="pw-active-banner"></div>
+      <div id="pw-compare" class="pw-compare"></div>
+      <div id="pw-baseline"></div>
+
+      <div class="card">
+        <div class="row-between">
+          <h2>🧾 供电调度回执台账（数据库触发器保证不可改 / 不可删）</h2>
+          <button class="btn tiny" onclick="loadPowerOverview()">刷新</button>
+        </div>
+        <div id="pw-receipts"></div>
       </div>
     </section>
   </main>
